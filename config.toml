@@ -1,0 +1,25 @@
+# RClauncher 設定 (UTF-8 で保存)
+# パスは ' ' (リテラル文字列) で囲むと \ をそのまま書けます。
+
+[general]
+# 右クリック2回とみなす間隔(ミリ秒)。0 = Windowsのダブルクリック時間に従う
+double_click_ms = 0
+
+[clipboard]
+max_items = 20      # 履歴の最大数 (1-500)。履歴は exe と同じ場所の clipboard\history.txt に保存
+group_size = 10      # 先頭からこの件数は直接表示、以降はサブメニューに分割 (1-50)
+
+[folder_menu]
+max_entries = 50    # 1つのサブメニューに出すフォルダ数の上限 (10-1000)
+show_hidden = false  # 隠し・システムフォルダも表示する
+history_max = 10     # フォルダ履歴の件数 (0 = 履歴を使わない)。exe と同じ場所の folder_history.txt に保存
+show_icons = true    # フォルダアイコンを表示する
+
+# デスクトップの何もない場所(アイコン・ショートカット以外)をダブルクリック → このフォルダ一覧
+[[folders]]
+name = "ドキュメント"
+path = '%USERPROFILE%\Documents'  # %環境変数% が使えます
+
+[[folders]]
+name = "ダウンロード"
+path = '%USERPROFILE%\Downloads'
