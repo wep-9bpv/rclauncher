@@ -46,6 +46,7 @@ const WM_APP_TRIGGER: u32 = WM_APP + 1; // フック → メインへの通知
 const WM_APP_TRAY: u32 = WM_APP + 2; // タスクトレイのコールバック
 const WM_APP_TRIGGER_FOLDER: u32 = WM_APP + 3; // デスクトップのダブルクリック
 const WM_APP_MENU_CLICK: u32 = WM_APP + 4; // フォルダメニュー表示中の左クリック通知
+const WM_APP_MENU_RCLICK: u32 = WM_APP + 5; // フォルダメニュー表示中の右クリック通知
 const TIMER_SHOW: usize = 1;
 const TIMER_CFG: usize = 2; // 設定ファイルの更新監視 (2秒ごと)
 const LVM_HITTEST: u32 = 0x1012; // LVM_FIRST + 18
@@ -154,6 +155,14 @@ fn load_config() -> Result<Config, String> {
     cfg.folder_menu.max_entries = cfg.folder_menu.max_entries.clamp(10, 1000);
     cfg.folder_menu.history_max = cfg.folder_menu.history_max.min(100);
     Ok(cfg)
+}
+
+/// 失敗の原因調査用。exe と同じ場所の rclauncher.log に1行追記する
+fn log_line(msg: &str) {
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(exe_dir().join("rclauncher.log")) {
+        let _ = writeln!(f, "{msg}");
+    }
 }
 
 // ───────────────────────── 履歴ファイル (clipboard/history.txt) ─────────────────────────
@@ -363,6 +372,7 @@ static SWALLOW_UP: AtomicBool = AtomicBool::new(false);
 static FOLDER_MENU_ACTIVE: AtomicBool = AtomicBool::new(false); // フォルダメニュー表示中
 static HOT_MENU: AtomicIsize = AtomicIsize::new(0); // 選択中の項目があるメニュー (WM_MENUSELECT)
 static HOT_ITEM: AtomicI32 = AtomicI32::new(-1); // 選択中の項目の位置 (サブメニュー項目のときのみ。それ以外は -1)
+static RMENU_DOWN: AtomicBool = AtomicBool::new(false); // フォルダ項目上で右ボタンが押された (UPを待つ)
 static SHOWING: AtomicBool = AtomicBool::new(false); // 自分のメニュー表示中はフック無効
 static DBL_MS: AtomicU32 = AtomicU32::new(500);
 static TB_CREATED: AtomicU32 = AtomicU32::new(0);
@@ -511,12 +521,32 @@ unsafe fn is_empty_desktop_spot(target: HWND, screen_pt: POINT) -> bool {
 // フック内では軽い処理だけを行う (約300msを超えるとWindowsにフックを外される)
 // 重い判定(アイコン上かどうか)は、メインスレッドへPostした後に行う。
 unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    if code == 0 && FOLDER_MENU_ACTIVE.load(Relaxed) {
-        // フォルダメニュー表示中: 左ボタンが離されたことをメインへ通知するだけ (握りつぶさない)
+    if code == 0 && FOLDER_MENU_ACTIVE.load(Relaxed) && !shellmenu::SHELL_MENU_ACTIVE.load(Relaxed) {
+        // フォルダメニュー表示中の処理
         let info = &*(lparam.0 as *const MSLLHOOKSTRUCT);
-        if info.flags & 1 == 0 && wparam.0 as u32 == WM_LBUTTONUP {
+        if info.flags & 1 == 0 {
             let hwnd = HWND(MAIN_HWND.load(Relaxed) as *mut c_void);
-            let _ = PostMessageW(hwnd, WM_APP_MENU_CLICK, WPARAM(0), LPARAM(0));
+            match wparam.0 as u32 {
+                // 左ボタンが離された → メインへ通知 (握りつぶさない。フォルダ名クリックで開く用)
+                WM_LBUTTONUP => {
+                    let _ = PostMessageW(hwnd, WM_APP_MENU_CLICK, WPARAM(0), LPARAM(0));
+                }
+                // フォルダ項目の上の右クリックは、メニュー本体には渡さずこちらで処理する
+                WM_RBUTTONDOWN => {
+                    if let Some(path) = shellmenu::path_at_point(hwnd, info.pt, false) {
+                        CONTEXT_PENDING.with(|c| *c.borrow_mut() = Some((path, info.pt)));
+                        RMENU_DOWN.store(true, Relaxed);
+                        return LRESULT(1);
+                    }
+                }
+                WM_RBUTTONUP => {
+                    if RMENU_DOWN.swap(false, Relaxed) {
+                        let _ = PostMessageW(hwnd, WM_APP_MENU_RCLICK, WPARAM(0), LPARAM(0));
+                        return LRESULT(1);
+                    }
+                }
+                _ => {}
+            }
         }
     }
     if code == 0 && !SHOWING.load(Relaxed) {
@@ -797,31 +827,36 @@ thread_local! {
     static CLICK_OPEN: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
+thread_local! {
+    // 右クリックされたフォルダ項目 (マウスフックが DOWN で記録し、UP で通知する)
+    static CONTEXT_PENDING: RefCell<Option<(String, POINT)>> = const { RefCell::new(None) };
+    // メインへ渡す「Explorer のメニューを出す」要求 (フォルダメニューを閉じた後に処理)
+    static CONTEXT_REQ: RefCell<Option<(String, POINT)>> = const { RefCell::new(None) };
+}
+
 /// フォルダ名(サブメニュー付き項目)の上で左クリックされたら、メニューを閉じてそのフォルダを開く要求を出す
 unsafe fn on_menu_click(hwnd: HWND) {
     if !FOLDER_MENU_ACTIVE.load(Relaxed) || shellmenu::SHELL_MENU_ACTIVE.load(Relaxed) {
         return;
     }
-    let (hm, hi) = (HOT_MENU.load(Relaxed), HOT_ITEM.load(Relaxed));
-    if hm == 0 || hi < 0 {
-        return;
-    }
-    let hmenu = HMENU(hm as *mut c_void);
-    // クリック位置が、選択中の項目の上であることを確認する (メニュー外のクリックを除く)
     let mut pt = POINT::default();
     let _ = GetCursorPos(&mut pt);
-    if MenuItemFromPoint(hwnd, hmenu, pt) != hi {
-        return;
-    }
-    let sub = GetSubMenu(hmenu, hi);
-    if sub.0.is_null() {
-        return;
-    }
-    let path = MENU_TREE.with(|t| t.borrow().paths.get(&(sub.0 as isize)).cloned());
-    if let Some(path) = path {
+    if let Some(path) = shellmenu::path_at_point(hwnd, pt, true) {
         CLICK_OPEN.with(|c| *c.borrow_mut() = Some(path));
         let _ = EndMenu();
     }
+}
+
+/// フォルダ項目の右クリック: フォルダメニューを閉じ、閉じた後に Explorer のメニューを出す
+unsafe fn on_menu_rclick() {
+    if !FOLDER_MENU_ACTIVE.load(Relaxed) {
+        return;
+    }
+    let Some(req) = CONTEXT_PENDING.with(|c| c.borrow_mut().take()) else {
+        return;
+    };
+    CONTEXT_REQ.with(|c| *c.borrow_mut() = Some(req));
+    let _ = EndMenu();
 }
 
 fn register_pending(menu: HMENU, path: String) {
@@ -1260,6 +1295,55 @@ unsafe fn show_clip_popup(hwnd: HWND) {
     }
 }
 
+enum FolderMenuResult {
+    Chosen(String), // 通常項目の選択 / フォルダ名のクリック
+    ClearHistory,
+    Context(String, POINT), // 右クリック → Explorer のメニュー要求
+    Cancel,
+}
+
+/// フォルダメニューを1回表示して、結果を返す
+unsafe fn run_folder_menu(
+    hwnd: HWND,
+    x: i32,
+    y: i32,
+    folders: &[Folder],
+    hist: &[String],
+    hist_on: bool,
+) -> FolderMenuResult {
+    reset_menu_tree();
+    CLICK_OPEN.with(|c| *c.borrow_mut() = None);
+    CONTEXT_REQ.with(|c| *c.borrow_mut() = None);
+    CONTEXT_PENDING.with(|c| *c.borrow_mut() = None);
+    RMENU_DOWN.store(false, Relaxed);
+    HOT_MENU.store(0, Relaxed);
+    HOT_ITEM.store(-1, Relaxed);
+
+    let menu = build_folder_menu(folders, hist, hist_on);
+    // サブメニューの遅延展開(WM_INITMENUPOPUP)と選択追跡(WM_MENUSELECT)のため TPM_NONOTIFY は付けない
+    FOLDER_MENU_ACTIVE.store(true, Relaxed);
+    let id = track_ex(hwnd, menu, x, y, TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN | TPM_RIGHTBUTTON);
+    FOLDER_MENU_ACTIVE.store(false, Relaxed);
+    let _ = DestroyMenu(menu); // 遅延生成したサブメニューも一緒に破棄される
+    free_icons(); // メニュー用ビットマップは別途破棄が必要
+
+    let ctx = CONTEXT_REQ.with(|c| c.borrow_mut().take());
+    let clicked = CLICK_OPEN.with(|c| c.borrow_mut().take());
+    let path = id.and_then(lookup_target); // reset_menu_tree の前に引く
+    reset_menu_tree();
+
+    if id == Some(CMD_FHIST_CLEAR) {
+        return FolderMenuResult::ClearHistory;
+    }
+    if let Some((p, pt)) = ctx {
+        return FolderMenuResult::Context(p, pt);
+    }
+    match path.or(clicked) {
+        Some(p) => FolderMenuResult::Chosen(p),
+        None => FolderMenuResult::Cancel,
+    }
+}
+
 /// フォルダ一覧メニュー (デスクトップの何もない場所でダブルクリック)
 unsafe fn show_folder_popup(hwnd: HWND) {
     let (x, y) = (PEND_X.load(Relaxed), PEND_Y.load(Relaxed));
@@ -1276,32 +1360,28 @@ unsafe fn show_folder_popup(hwnd: HWND) {
     let (folders, hist, hist_on) = snap.unwrap_or_default();
 
     SHOWING.store(true, Relaxed);
-    reset_menu_tree();
-    CLICK_OPEN.with(|c| *c.borrow_mut() = None);
-    HOT_MENU.store(0, Relaxed);
-    HOT_ITEM.store(-1, Relaxed);
-    let menu = build_folder_menu(&folders, &hist, hist_on);
-    // サブメニューの遅延展開(WM_INITMENUPOPUP)と選択追跡(WM_MENUSELECT)のため TPM_NONOTIFY は付けない
-    FOLDER_MENU_ACTIVE.store(true, Relaxed);
-    let id = track_ex(hwnd, menu, x, y, TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN | TPM_RIGHTBUTTON);
-    FOLDER_MENU_ACTIVE.store(false, Relaxed);
-    let _ = DestroyMenu(menu); // 遅延生成したサブメニューも一緒に破棄される
-    free_icons(); // メニュー用ビットマップは別途破棄が必要
+    let result = loop {
+        match run_folder_menu(hwnd, x, y, &folders, &hist, hist_on) {
+            FolderMenuResult::Context(path, pt) => {
+                // メニューの上に別のメニューは出せないため、フォルダメニューを閉じてから Explorer のメニューを出す。
+                // コマンドを実行したら終了。選ばずに閉じたら、フォルダメニューへ戻る。
+                if shellmenu::show_shell_menu(hwnd, &path, pt.x, pt.y) {
+                    break FolderMenuResult::Cancel;
+                }
+            }
+            other => break other,
+        }
+    };
     SHOWING.store(false, Relaxed);
     HAVE_LAST.store(false, Relaxed);
     HAVE_LAST_L.store(false, Relaxed);
 
-    // 通常の項目の選択 → そのフォルダ。フォルダ名(サブメニュー付き項目)のクリック → CLICK_OPEN。
-    let clicked = CLICK_OPEN.with(|c| c.borrow_mut().take());
-    let path = id.and_then(lookup_target).or(clicked);
-    reset_menu_tree();
-
     restore_foreground(prev);
 
-    if id == Some(CMD_FHIST_CLEAR) {
-        clear_folder_history();
-    } else if let Some(path) = path {
-        open_folder_checked(&path);
+    match result {
+        FolderMenuResult::ClearHistory => clear_folder_history(),
+        FolderMenuResult::Chosen(path) => open_folder_checked(&path),
+        _ => {}
     }
 }
 
@@ -1464,10 +1544,28 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         return r;
     }
     match msg {
+        WM_APP_TRAY => {
+            if wparam.0 == 1 && matches!(lparam.0 as u32, WM_RBUTTONUP | WM_CONTEXTMENU) {
+                show_tray_menu(hwnd);
+            }
+            LRESULT(0)
+        }
         WM_CLIPBOARDUPDATE => {
             on_clipboard_update(hwnd);
             LRESULT(0)
         }
+        WM_TIMER => match wparam.0 {
+            TIMER_SHOW => {
+                let _ = KillTimer(hwnd, TIMER_SHOW);
+                show_clip_popup(hwnd);
+                LRESULT(0)
+            }
+            TIMER_CFG => {
+                check_config_changed();
+                LRESULT(0)
+            }
+            _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+        },
         WM_APP_TRIGGER => {
             on_trigger(hwnd);
             LRESULT(0)
@@ -1493,27 +1591,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             on_menu_click(hwnd);
             LRESULT(0)
         }
-        WM_MENURBUTTONUP => {
-            // フォルダ項目の右クリック → Explorer のコンテキストメニュー
-            shellmenu::on_menu_rbutton(hwnd, wparam.0 as u32, HMENU(lparam.0 as *mut c_void));
-            LRESULT(0)
-        }
-        WM_TIMER => {
-            if wparam.0 == TIMER_SHOW {
-                let _ = KillTimer(hwnd, TIMER_SHOW);
-                show_clip_popup(hwnd);
-            } else if wparam.0 == TIMER_CFG {
-                check_config_changed();
-            }
-            LRESULT(0)
-        }
-        WM_APP_TRAY => {
-            if (lparam.0 as u32 & 0xFFFF) == WM_RBUTTONUP || (lparam.0 as u32 & 0xFFFF) == WM_LBUTTONUP {
-                show_tray_menu(hwnd);
-            }
+        WM_APP_MENU_RCLICK => {
+            on_menu_rclick();
             LRESULT(0)
         }
         WM_DESTROY => {
+            let _ = KillTimer(hwnd, TIMER_SHOW);
+            let _ = KillTimer(hwnd, TIMER_CFG);
             let _ = RemoveClipboardFormatListener(hwnd);
             remove_tray(hwnd);
             PostQuitMessage(0);

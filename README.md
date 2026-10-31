@@ -38,6 +38,8 @@
 - config.toml を直接編集して保存すると、2秒以内に自動で再読み込み
 - Windows 起動時に自動起動 : HKCU\Software\Microsoft\Windows\CurrentVersion\Run に登録
 
-## Explorer の右クリックメニュー
-- フォルダ一覧のフォルダ項目を右クリック → Explorer と同じメニュー (Shift+右クリックで拡張メニュー)
+## アプリ内フォルダ一覧の右クリックメニュー
+- フォルダ一覧のフォルダ項目を右クリック → フォルダ一覧がいったん閉じ、Explorer と同じ右クリックメニューを表示 (Shift+右クリックで拡張メニュー)
+- メニューを選ばずにEscキーで閉じると、フォルダ一覧が同じ位置に開き直す
+- エラー発生時は、exeファイルと同じ場所の `rclauncher.log` に記録
 - Explorer のメニューには他社のシェル拡張が読み込まれる。不安定になる場合は main.rs の `shellmenu::` の3か所を外すと無効化できる
